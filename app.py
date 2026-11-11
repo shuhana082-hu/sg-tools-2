@@ -6,7 +6,7 @@ from markupsafe import Markup
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
-app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 DB = os.environ.get("DB_PATH", "data.db")
 
@@ -324,7 +324,11 @@ document.getElementById('ct').placeholder=h?'<!doctype html>...':'https://exampl
 document.getElementById('hf').onchange=function(){var f=this.files[0];if(!f)return;var r=new FileReader();r.onload=function(){document.getElementById('ct').value=r.result};r.readAsText(f)};
 var pv=document.getElementById('pv');function show(u){pv.innerHTML='';if(!u)return;var i=document.createElement('img');i.src=u;pv.append(i)}
 document.getElementById('iu').oninput=function(){show(this.value)};
-document.getElementById('if').onchange=function(){var f=this.files[0];if(f)show(URL.createObjectURL(f))};</script>{% endblock %}"""
+document.getElementById('if').onchange=function(){var inp=this,f=inp.files[0];if(!f)return;show(URL.createObjectURL(f));
+if(f.type==='image/gif'&&f.size<2e6)return;
+var im=new Image();im.onload=function(){var r=Math.min(1,600/Math.max(im.width,im.height)),c=document.createElement('canvas');c.width=Math.round(im.width*r);c.height=Math.round(im.height*r);
+c.getContext('2d').drawImage(im,0,0,c.width,c.height);
+c.toBlob(function(b){if(!b)return;try{var dt=new DataTransfer();dt.items.add(new File([b],'photo.webp',{type:b.type}));inp.files=dt.files}catch(e){}},'image/webp',0.85)};im.src=URL.createObjectURL(f)};</script>{% endblock %}"""
 
 env = Environment(loader=DictLoader(T), autoescape=True)
 
@@ -333,6 +337,11 @@ def render(name, **c):
     c.update(icon=icon, t=session.setdefault("t", secrets.token_hex(16)), picker=PICKER)
     c.setdefault("s", S())
     return env.get_template(name).render(**c)
+
+
+@app.errorhandler(413)
+def too_large(_):
+    return "File too large (max 25 MB). Go back and choose a smaller file.", 413
 
 
 @app.before_request
