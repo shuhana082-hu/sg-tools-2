@@ -6,6 +6,7 @@ from markupsafe import Markup
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
+app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 DB = os.environ.get("DB_PATH", "data.db")
 
@@ -82,7 +83,10 @@ def init():
     CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, descr TEXT, cat TEXT,
         badge TEXT, icon TEXT, kind TEXT, content TEXT, sort INTEGER DEFAULT 0, visible INTEGER DEFAULT 1);
     CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, text TEXT, ts INTEGER);
-    CREATE TABLE IF NOT EXISTS online(sid TEXT PRIMARY KEY, ts INTEGER);""")
+    CREATE TABLE IF NOT EXISTS online(sid TEXT PRIMARY KEY, ts INTEGER);
+    CREATE TABLE IF NOT EXISTS uploads(id INTEGER PRIMARY KEY AUTOINCREMENT, mime TEXT, data BLOB);""")
+    if "image" not in [r[1] for r in c.execute("PRAGMA table_info(items)")]:
+        c.execute("ALTER TABLE items ADD COLUMN image TEXT DEFAULT ''")
     for k, v in DEFAULTS.items():
         c.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, v))
     c.commit()
@@ -172,6 +176,10 @@ label.l{display:block;font-size:.78rem;color:var(--mut);margin-bottom:5px}
 .sw{display:flex;gap:8px;align-items:center}.sw input{width:auto}
 .login{max-width:360px;margin:14vh auto;text-align:center}.login .logo{width:64px;height:64px;border-radius:18px;margin-bottom:12px}
 .err{color:#ff8a8a;font-size:.85rem;margin-bottom:10px}
+.th{padding:0;overflow:hidden}.th img{width:100%;height:100%;object-fit:cover;display:block}.th .ic{display:none}
+.pv{width:96px;height:96px;border-radius:18px;border:1px dashed var(--line);margin-bottom:12px;overflow:hidden;display:grid;place-items:center}
+.pv:empty:before{content:"No photo";font-size:.72rem;color:var(--mut)}.pv img{width:100%;height:100%;object-fit:cover}
+.fr{margin-bottom:8px}input[type=file]{padding:9px}
 """
 
 T = {}
@@ -199,7 +207,7 @@ T["index.html"] = """{% extends "base.html" %}{% block body %}
 <section class="grid">
 {% for it in items %}
   <a class="card fade" data-c="{{ it.cat }}" href="/t/{{ it.id }}" style="--d:{{ 200 + loop.index0*50 }}ms">
-    <div class="ico">{{ icon(it.icon) }}</div>
+    <div class="ico{{ ' th' if it.image }}">{% if it.image %}<img src="{{ it.image }}" alt="" loading="lazy" onerror="this.parentNode.classList.remove('th');this.remove()">{% endif %}{{ icon(it.icon) }}</div>
     <div><h3>{{ it.title }}</h3><p>{{ it.descr }}</p>
       <div class="tags"><u>{{ it.cat|upper }}</u>{% if it.badge %}<u class="hot">{{ it.badge }}</u>{% endif %}</div></div>
     <span class="go">{{ icon('arrow') }}</span>
@@ -256,7 +264,7 @@ T["admin.html"] = """{% extends "base.html" %}{% block title %}Admin - {{ s.site
 <div class="box fade" style="--d:60ms"><h3>{{ icon('wrench') }}Tools and Games <a class="btn sm" style="margin-left:auto" href="/admin/item">{{ icon('plus') }}Add new</a></h3>
 {% for it in items %}
   <div class="row {{ '' if it.visible else 'off' }}">
-    <div class="ico">{{ icon(it.icon) }}</div>
+    <div class="ico{{ ' th' if it.image }}">{% if it.image %}<img src="{{ it.image }}" alt="" loading="lazy" onerror="this.parentNode.classList.remove('th');this.remove()">{% endif %}{{ icon(it.icon) }}</div>
     <div class="g"><b>{{ it.title }}</b><span>{{ it.cat|upper }} / {{ it.kind|upper }} / {{ it.content[:70] if it.kind == 'link' else 'HTML code' }}</span></div>
     <a class="btn ghost sm" href="/admin/item/{{ it.id }}">{{ icon('edit') }}</a>
     <form method="post" action="/admin/item/{{ it.id }}/toggle"><input type="hidden" name="_t" value="{{ t }}"><button class="btn ghost sm">{{ icon('eye') }}</button></form>
@@ -285,7 +293,7 @@ T["admin.html"] = """{% extends "base.html" %}{% block title %}Admin - {{ s.site
 T["item.html"] = """{% extends "base.html" %}{% block title %}Item - Admin{% endblock %}{% block body %}
 <div class="wrap">
 <div class="top fade"><h2>{{ icon('plus') }}{{ 'Edit item' if it else 'New item' }}</h2><a class="btn ghost sm" href="/admin">Back</a></div>
-<form class="box fade" method="post"><input type="hidden" name="_t" value="{{ t }}">
+<form class="box fade" method="post" enctype="multipart/form-data"><input type="hidden" name="_t" value="{{ t }}">
   <div class="f2">
     <div><label class="l">Title</label><input name="title" required maxlength="80" value="{{ it.title if it }}"></div>
     <div><label class="l">Short description</label><input name="descr" maxlength="200" value="{{ it.descr if it }}"></div>
@@ -295,14 +303,28 @@ T["item.html"] = """{% extends "base.html" %}{% block title %}Item - Admin{% end
     <div><label class="l">Type</label><select name="kind" id="kind" onchange="k()"><option value="link" {{ 'selected' if it and it.kind == 'link' }}>Link</option><option value="html" {{ 'selected' if it and it.kind == 'html' }}>HTML code</option></select></div>
   </div>
   <label class="l" style="margin-top:14px" id="cl">Content</label>
-  <textarea name="content" id="ct" class="mono" required>{{ it.content if it }}</textarea>
+  <div class="fr"><label class="btn ghost sm" id="hfb" for="hf">{{ icon('code') }}Upload HTML file</label><input type="file" id="hf" accept=".html,.htm,text/html" hidden></div>
+  <textarea name="content" id="ct" class="mono">{{ it.content if it }}</textarea>
+  {% if err %}<div class="err" style="margin-top:8px">{{ err }}</div>{% endif %}
+  <label class="l" style="margin-top:14px">Photo (small thumbnail on the card)</label>
+  <div class="pv" id="pv">{% if it and it.image %}<img src="{{ it.image }}" alt="">{% endif %}</div>
+  <div class="f2">
+    <div><label class="l">Photo link</label><input name="image_url" id="iu" placeholder="https://..." value="{{ it.image if it and it.image and not it.image.startswith('/u/') }}"></div>
+    <div><label class="l">Or upload from device</label><input type="file" name="image_file" id="if" accept="image/png,image/jpeg,image/gif,image/webp"></div>
+  </div>
+  {% if it and it.image %}<label class="sw" style="margin-top:10px"><input type="checkbox" name="rm_image" value="1">Remove photo</label>{% endif %}
   <label class="l" style="margin-top:14px">Icon</label>
   <div class="picker">{% for n in picker %}<label class="ip"><input type="radio" name="icon" value="{{ n }}" {{ 'checked' if (it.icon if it else 'bolt') == n }}>{{ icon(n) }}</label>{% endfor %}</div>
   <label class="sw" style="margin:14px 0"><input type="checkbox" name="visible" value="1" {{ 'checked' if (it.visible if it else 1) }}>Visible on site</label>
   <button class="btn">Save</button>
 </form></div>
 <script>function k(){var h=document.getElementById('kind').value==='html';document.getElementById('cl').textContent=h?'Full HTML code (hosted at /t/ID)':'Link (https://...)';
-document.getElementById('ct').placeholder=h?'<!doctype html>...':'https://example.com';document.getElementById('ct').style.minHeight=h?'320px':'80px'}k()</script>{% endblock %}"""
+document.getElementById('hfb').style.display=h?'':'none';
+document.getElementById('ct').placeholder=h?'<!doctype html>...':'https://example.com';document.getElementById('ct').style.minHeight=h?'320px':'80px'}k();
+document.getElementById('hf').onchange=function(){var f=this.files[0];if(!f)return;var r=new FileReader();r.onload=function(){document.getElementById('ct').value=r.result};r.readAsText(f)};
+var pv=document.getElementById('pv');function show(u){pv.innerHTML='';if(!u)return;var i=document.createElement('img');i.src=u;pv.append(i)}
+document.getElementById('iu').oninput=function(){show(this.value)};
+document.getElementById('if').onchange=function(){var f=this.files[0];if(f)show(URL.createObjectURL(f))};</script>{% endblock %}"""
 
 env = Environment(loader=DictLoader(T), autoescape=True)
 
@@ -405,6 +427,35 @@ def settings():
     return redirect("/admin")
 
 
+def sniff(b):
+    if b[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if b[:4] == b"GIF8":
+        return "image/gif"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def drop_upload(path):
+    m = re.match(r"^/u/(\d+)$", path or "")
+    if m:
+        q("DELETE FROM uploads WHERE id=?", (int(m.group(1)),))
+
+
+@app.route("/u/<int:i>")
+def upload(i):
+    r = q("SELECT mime,data FROM uploads WHERE id=?", (i,), True)
+    if not r:
+        abort(404)
+    resp = Response(r["data"], mimetype=r["mime"])
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
 @app.route("/admin/item", methods=["GET", "POST"])
 @app.route("/admin/item/<int:i>", methods=["GET", "POST"])
 @need
@@ -412,26 +463,60 @@ def item(i=None):
     it = dict(q("SELECT * FROM items WHERE id=?", (i,), True) or {}) if i else None
     if i and not it:
         abort(404)
+    err = None
     if request.method == "POST":
         f = request.form
         kind = "html" if f.get("kind") == "html" else "link"
         content = f.get("content", "").strip()
-        if kind == "link" and not re.match(r"^(https?://|/)", content):
-            content = "https://" + content
-        icn = f.get("icon") if f.get("icon") in ICONS else "bolt"
         try:
             sort = int(f.get("sort") or 0)
         except ValueError:
             sort = 0
-        vals = (f.get("title", "").strip()[:80], f.get("descr", "").strip()[:200],
-                "game" if f.get("cat") == "game" else "tool", f.get("badge", "").strip()[:12].upper(),
-                icn, kind, content, sort, 1 if f.get("visible") else 0)
-        if i:
-            q("UPDATE items SET title=?,descr=?,cat=?,badge=?,icon=?,kind=?,content=?,sort=?,visible=? WHERE id=?", vals + (i,))
+        icn = f.get("icon") if f.get("icon") in ICONS else "bolt"
+        vis = 1 if f.get("visible") else 0
+        cat = "game" if f.get("cat") == "game" else "tool"
+        title = f.get("title", "").strip()[:80]
+        descr = f.get("descr", "").strip()[:200]
+        badge = f.get("badge", "").strip()[:12].upper()
+        if not content:
+            err = "Content is empty: add a link, paste code, or upload an HTML file."
+        elif kind == "link" and not re.match(r"^(https?://|/)", content):
+            content = "https://" + content
+        newimg = None
+        if not err:
+            file = request.files.get("image_file")
+            url = f.get("image_url", "").strip()
+            if file and file.filename:
+                data = file.read()
+                mime = sniff(data)
+                if not mime:
+                    err = "Photo must be a JPG, PNG, GIF or WEBP image."
+                else:
+                    cur = db().execute("INSERT INTO uploads(mime,data) VALUES(?,?)", (mime, data))
+                    db().commit()
+                    newimg = "/u/%d" % cur.lastrowid
+            elif url:
+                newimg = url if re.match(r"^(https?://|/)", url) else "https://" + url
+            elif f.get("rm_image"):
+                newimg = ""
+        if err:
+            shown = dict(it or {}, title=title, descr=descr, cat=cat, badge=badge, sort=sort,
+                         kind=kind, content=content, visible=vis, icon=icn)
+            return render("item.html", it=shown, err=err)
+        old = (it or {}).get("image") or ""
+        if newimg is None:
+            image = old
         else:
-            q("INSERT INTO items(title,descr,cat,badge,icon,kind,content,sort,visible) VALUES(?,?,?,?,?,?,?,?,?)", vals)
+            image = newimg
+            if old != newimg:
+                drop_upload(old)
+        vals = (title, descr, cat, badge, icn, kind, content, sort, vis, image)
+        if i:
+            q("UPDATE items SET title=?,descr=?,cat=?,badge=?,icon=?,kind=?,content=?,sort=?,visible=?,image=? WHERE id=?", vals + (i,))
+        else:
+            q("INSERT INTO items(title,descr,cat,badge,icon,kind,content,sort,visible,image) VALUES(?,?,?,?,?,?,?,?,?,?)", vals)
         return redirect("/admin")
-    return render("item.html", it=it)
+    return render("item.html", it=it, err=err)
 
 
 @app.route("/admin/item/<int:i>/toggle", methods=["POST"])
@@ -444,6 +529,9 @@ def toggle(i):
 @app.route("/admin/item/<int:i>/delete", methods=["POST"])
 @need
 def delete(i):
+    r = q("SELECT image FROM items WHERE id=?", (i,), True)
+    if r:
+        drop_upload(r["image"])
     q("DELETE FROM items WHERE id=?", (i,))
     return redirect("/admin")
 
