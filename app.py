@@ -347,7 +347,7 @@ T["sitegrab.html"] = r"""{% extends "base.html" %}{% block title %}Site Download
 <div class="wrap" style="max-width:640px">
 <div class="top fade"><h2>{{ icon('download') }}Site Downloader</h2><a class="btn ghost sm" href="/">Home</a></div>
 <div class="box fade" style="--d:80ms">
-  <p class="mut" style="margin-bottom:16px">Enter a website link to collect its HTML, CSS, JavaScript, images and fonts into one ZIP file. A direct file link (.txt, .py, .pdf, .zip, or any other file) downloads as that file.</p>
+  <p class="mut" style="margin-bottom:16px">Enter a website link to collect its HTML, CSS, JavaScript, images and fonts into one ZIP file. A direct file link (.txt, .py, .pdf, .zip, or any other file) downloads as that file. In the whole-site modes, any downloadable files linked on the pages (PDF, ZIP, APK, MP3, DOCX and more) are collected too.</p>
   <label class="l">Website link</label>
   <input id="u" inputmode="url" autocapitalize="off" placeholder="https://example.com">
   <label class="l" style="margin-top:12px">What to download</label>
@@ -360,8 +360,8 @@ T["sitegrab.html"] = r"""{% extends "base.html" %}{% block title %}Site Download
 <script>
 var b=document.getElementById('go'),st=document.getElementById('st'),tm;
 b.onclick=function(){var u=document.getElementById('u').value.trim();if(!u){st.textContent='Enter a link first';return}
- b.disabled=true;var s0=Date.now();st.textContent='Working... 0s (can take up to a minute)';
- tm=setInterval(function(){st.textContent='Working... '+Math.round((Date.now()-s0)/1000)+'s (can take up to a minute)'},1000);
+ b.disabled=true;var s0=Date.now();st.textContent='Working... 0s (can take up to 2 minutes for a full site)';
+ tm=setInterval(function(){st.textContent='Working... '+Math.round((Date.now()-s0)/1000)+'s (can take up to 2 minutes for a full site)'},1000);
  fetch('/sitegrab/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u,pages:+document.getElementById('m').value})})
  .then(function(r){if(!r.ok)return r.json().then(function(j){throw new Error(j.error||'Failed')});
   var n=r.headers.get('X-Files')||'',nm=r.headers.get('X-Name')||'site';
@@ -461,11 +461,15 @@ def chat():
 ASSET_EXT = {"css", "js", "mjs", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "avif", "woff", "woff2",
              "ttf", "otf", "eot", "mp4", "webm", "mp3", "ogg", "wav", "json", "xml", "txt", "pdf", "zip", "map", "webmanifest"}
 PAGE_EXT = {"", "html", "htm", "php", "asp", "aspx", "jsp"}
+DOWNLOAD_EXT = {"pdf", "zip", "rar", "7z", "tar", "gz", "apk", "exe", "msi", "dmg",
+                "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "epub", "mobi",
+                "mp3", "mp4", "mkv", "avi", "mov", "wav", "flac", "m4a", "psd", "ai",
+                "ttf", "otf", "woff", "woff2", "rtf", "txt", "json", "xml", "svg", "ico"}
 UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 ALLOWED_PORTS = (None, 80, 443)
 GRAB_SLOTS = threading.Semaphore(2)
 GRAB_HITS = {}
-MAX_TOTAL = 60 * 1024 * 1024
+MAX_TOTAL = 120 * 1024 * 1024
 TAG_RE = re.compile(r"<(a|area|link|script|img|source|video|audio|iframe|embed|track)\b([^>]*)>", re.I | re.S)
 ATTR_RE = re.compile(r"\b(src|href|poster|data-src|srcset|data-srcset)\s*=\s*(\"([^\"]*)\"|'([^']*)')", re.I)
 CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.I)
@@ -565,6 +569,12 @@ def grab(start, maxpages):
                     queue.append(a)
                 if a in pages:
                     return rel(pages[a], cur)
+                return a
+            if ext in DOWNLOAD_EXT:
+                if a not in assets and len(assets) < 600:
+                    assets[a] = lpath(a, main)
+                if a in assets:
+                    return rel(assets[a], cur)
             return a
         if kind == "abs":
             return a
