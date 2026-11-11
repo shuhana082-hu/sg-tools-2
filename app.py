@@ -1,12 +1,21 @@
 import os, re, sqlite3, time, secrets
 from functools import wraps
-from flask import Flask, g, request, session, redirect, jsonify, Response, abort
+from flask import Flask, Request, g, request, session, redirect, jsonify, Response, abort
 from jinja2 import Environment, DictLoader
 from markupsafe import Markup
 
+MAX_MB = 50
+
+
+class BigRequest(Request):
+    # Werkzeug 3.1+ limits text form fields to 500 KB by default, which blocks large pasted HTML code
+    max_form_memory_size = MAX_MB * 1024 * 1024
+
+
 app = Flask(__name__)
+app.request_class = BigRequest
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_MB * 1024 * 1024
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 DB = os.environ.get("DB_PATH", "data.db")
 
@@ -341,7 +350,7 @@ def render(name, **c):
 
 @app.errorhandler(413)
 def too_large(_):
-    return "File too large (max 25 MB). Go back and choose a smaller file.", 413
+    return "File too large (max " + str(MAX_MB) + " MB). Go back and choose a smaller file.", 413
 
 
 @app.before_request
