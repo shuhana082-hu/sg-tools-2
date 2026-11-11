@@ -347,11 +347,11 @@ T["sitegrab.html"] = r"""{% extends "base.html" %}{% block title %}Site Download
 <div class="wrap" style="max-width:640px">
 <div class="top fade"><h2>{{ icon('download') }}Site Downloader</h2><a class="btn ghost sm" href="/">Home</a></div>
 <div class="box fade" style="--d:80ms">
-  <p class="mut" style="margin-bottom:16px">Enter a website link. Its HTML, CSS, JavaScript, images and fonts are collected into one ZIP file that opens offline.</p>
+  <p class="mut" style="margin-bottom:16px">Enter a website link to collect its HTML, CSS, JavaScript, images and fonts into one ZIP file. A direct file link (.txt, .py, .pdf, .zip, or any other file) downloads as that file.</p>
   <label class="l">Website link</label>
   <input id="u" inputmode="url" autocapitalize="off" placeholder="https://example.com">
   <label class="l" style="margin-top:12px">What to download</label>
-  <select id="m"><option value="1">Single page</option><option value="5">Whole site, up to 5 pages</option><option value="15">Whole site, up to 15 pages</option><option value="40">Whole site, up to 40 pages</option></select>
+  <select id="m"><option value="1">Single page</option><option value="5">Whole site, up to 5 pages</option><option value="15">Whole site, up to 15 pages</option><option value="40">Whole site, up to 40 pages</option><option value="2000">Whole site, every page (as many as time allows)</option></select>
   <button class="btn" id="go" style="width:100%;margin-top:16px">{{ icon('download') }}Download files</button>
   <div id="st" class="mut" style="margin-top:14px;min-height:22px"></div>
 </div>
@@ -369,6 +369,27 @@ b.onclick=function(){var u=document.getElementById('u').value.trim();if(!u){st.t
  .catch(function(e){st.textContent=e.message||'Failed'})
  .then(function(){clearInterval(tm);b.disabled=false})};
 </script>{% endblock %}"""
+
+T["capture.html"] = r"""{% extends "base.html" %}{% block title %}Page Capture{% endblock %}{% block body %}
+<div class="wrap" style="max-width:640px">
+<div class="top fade"><h2>{{ icon('camera') }}Page Capture</h2><a class="btn ghost sm" href="/">Home</a></div>
+<div class="box fade" style="--d:80ms">
+  <p class="mut" style="margin-bottom:16px">Save this button to your browser's bookmarks. Then open any website, tap the bookmark, and that page's HTML, CSS, JS and images are packed into a ZIP and downloaded, including content added by JavaScript.</p>
+  <a class="btn" href="{{ bookmarklet }}" onclick="return confirm('Don\'t tap this here — save it as a bookmark instead, then use it from the website you want to capture.')" style="width:100%;justify-content:center">{{ icon('download') }}Capture this page</a>
+</div>
+<div class="box fade" style="--d:140ms"><h3>{{ icon('settings') }}How to save it as a bookmark</h3>
+  <div class="row"><div class="g"><b>Chrome / most Android browsers</b><span>Bookmark any page first (star icon), then open your Bookmarks, edit that bookmark, and replace its address with the code below.</span></div></div>
+  <div class="row"><div class="g"><b>Desktop</b><span>Drag the button above onto your bookmarks bar.</span></div></div>
+  <label class="l" style="margin-top:14px">Bookmarklet code (paste as the bookmark's URL)</label>
+  <textarea class="mono" id="code" readonly style="min-height:110px">{{ bookmarklet }}</textarea>
+  <button class="btn ghost sm" id="cp" style="margin-top:10px">{{ icon('code') }}Copy code</button>
+</div>
+<p class="mut fade" style="--d:200ms;font-size:.8rem">This captures what the browser has already loaded: HTML, CSS, JS and media. It cannot capture a site's server-side code (PHP, Laravel, databases) since that never reaches the browser. Only capture pages you own or have permission to copy.</p>
+</div>
+<script>document.getElementById('cp').onclick=function(){var t=document.getElementById('code');t.select();t.setSelectionRange(0,999999);
+try{navigator.clipboard.writeText(t.value);this.textContent='Copied!'}catch(e){document.execCommand('copy');this.textContent='Copied!'}
+setTimeout(function(){document.getElementById('cp').innerHTML='{{ icon("code")|e }}Copy code'},1500)};</script>
+{% endblock %}"""
 
 env = Environment(loader=DictLoader(T), autoescape=True)
 
@@ -518,7 +539,7 @@ def decode(data, enc):
 def grab(start, maxpages):
     main = urlparse(start).netloc.lower()
     t0 = time.time()
-    t_pages, t_end = t0 + 25, t0 + 55
+    t_pages, t_end = t0 + 60, t0 + 100
     files, assets, pages, queue = {}, {}, {start: "index.html"}, [start]
     stat = {"failed": 0, "size": 0}
 
@@ -656,7 +677,7 @@ def sitegrab_dl():
         url = "https://" + url
     p = urlparse(url)
     try:
-        pages = max(1, min(40, int(d.get("pages", 1))))
+        pages = max(1, min(2000, int(d.get("pages", 1))))
     except (TypeError, ValueError):
         pages = 1
     if not p.hostname or p.port not in ALLOWED_PORTS or not safe_host(p.hostname):
@@ -670,6 +691,18 @@ def sitegrab_dl():
         return jsonify(error="Server is busy. Try again in a moment."), 503
     try:
         GRAB_HITS[ip] = hits + [now]
+        peek = fetch(urldefrag(url)[0], time.time() + 20, limit=55 * 1024 * 1024)
+        if peek and "html" not in peek[1]:
+            final, ctype, data, _ = peek
+            fname = posixpath.basename(urlparse(final).path) or "file"
+            if "." not in fname:
+                fname += {"text/plain": ".txt", "application/pdf": ".pdf", "application/zip": ".zip",
+                          "application/json": ".json", "image/png": ".png", "image/jpeg": ".jpg"}.get(ctype, "")
+            resp = Response(data, mimetype=ctype or "application/octet-stream")
+            resp.headers["Content-Disposition"] = 'attachment; filename="%s"' % re.sub(r"[^\w.\-]", "_", fname)
+            return resp
+        if not peek:
+            return jsonify(error="Could not open this link. Check it, or the site may block downloads."), 422
         data, n, name = grab(urldefrag(url)[0], pages)
     except ValueError as e:
         return jsonify(error=str(e)), 422
@@ -682,6 +715,170 @@ def sitegrab_dl():
     resp.headers["X-Files"] = str(n)
     resp.headers["X-Name"] = name
     return resp
+
+
+# ---------------- live capture (bookmarklet) ----------------
+CAP_STORE = {}
+CAP_LOCK = threading.Lock()
+CAP_TTL = 15 * 60
+
+
+def cap_gc():
+    now = time.time()
+    with CAP_LOCK:
+        for k in [k for k, v in CAP_STORE.items() if now - v["ts"] > CAP_TTL]:
+            CAP_STORE.pop(k, None)
+
+
+def cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    return resp
+
+
+@app.route("/capture/submit", methods=["POST", "OPTIONS"])
+def capture_submit():
+    if request.method == "OPTIONS":
+        return cors(Response(""))
+    cap_gc()
+    d = request.get_json(silent=True, force=True) or {}
+    url = str(d.get("url", "")).strip()
+    html = str(d.get("html", ""))
+    assets = d.get("assets") or []
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return cors(jsonify(error="Invalid page URL")), 400
+    if not html:
+        return cors(jsonify(error="No page content received")), 400
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+    now = time.time()
+    with CAP_LOCK:
+        hits = [x for x in GRAB_HITS.get("cap:" + ip, []) if now - x < 600]
+        if len(hits) >= 8:
+            return cors(jsonify(error="Too many captures. Wait a few minutes.")), 429
+        GRAB_HITS["cap:" + ip] = hits + [now]
+        token = secrets.token_hex(12)
+        CAP_STORE[token] = {"url": url, "html": html[:4_000_000],
+                             "assets": [str(a) for a in assets if isinstance(a, str)][:500], "ts": now}
+    return cors(jsonify(token=token))
+
+
+def build_capture_zip(page_url, html, asset_urls, deadline):
+    main = urlparse(page_url).netloc.lower()
+    links = {}
+    for raw in asset_urls:
+        try:
+            u = urldefrag(urljoin(page_url, raw))[0]
+        except Exception:
+            continue
+        pu = urlparse(u)
+        if pu.scheme in ("http", "https") and u not in links and len(links) < 400:
+            links[u] = lpath(u, main, force={"css": ".css", "js": ".js"}.get(pu.path.rsplit(".", 1)[-1].lower() if "." in pu.path.rsplit("/", 1)[-1] else ""))
+
+    def resolve(v):
+        v = v.strip()
+        if not v or v[0] == "#" or re.match(r"(data|javascript|mailto|tel|blob|about):", v, re.I):
+            return None
+        try:
+            return urldefrag(urljoin(page_url, v))[0]
+        except Exception:
+            return None
+
+    def rewrite_css(text):
+        def u(m):
+            q = m.group(1)
+            a = resolve(m.group(2))
+            return "url(%s%s%s)" % (q, links.get(a, a or m.group(2)), q)
+        text = CSS_URL_RE.sub(u, text)
+        return CSS_IMP_RE.sub(lambda m: "@import %s%s%s" % (m.group(1), links.get(resolve(m.group(2)) or "", m.group(2)), m.group(1)), text)
+
+    def rewrite_html(html):
+        html = re.sub(r"<base\b[^>]*>", "", html, flags=re.I)
+        html = re.sub(r"\sintegrity\s*=\s*(\"[^\"]*\"|'[^']*')", "", html, flags=re.I)
+
+        def tag(m):
+            attrs = m.group(2)
+
+            def at(am):
+                attr = am.group(1).lower()
+                val = am.group(3) if am.group(3) is not None else am.group(4)
+                q = '"' if am.group(3) is not None else "'"
+                if attr in ("srcset", "data-srcset"):
+                    parts = []
+                    for part in val.split(","):
+                        bits = part.strip().split(None, 1)
+                        if bits:
+                            a = resolve(bits[0])
+                            parts.append(" ".join([links.get(a, bits[0])] + bits[1:]))
+                    nv = ", ".join(parts)
+                else:
+                    a = resolve(val)
+                    nv = links.get(a, val) if a else val
+                return "%s=%s%s%s" % (am.group(1), q, nv.replace('"', "%22").replace("'", "%27"), q)
+            return "<" + m.group(1) + ATTR_RE.sub(at, attrs) + ">"
+
+        html = TAG_RE.sub(tag, html)
+        html = re.sub(r"(<style[^>]*>)(.*?)(</style>)", lambda m: m.group(1) + rewrite_css(m.group(2)) + m.group(3), html, flags=re.I | re.S)
+        html = re.sub(r"(\sstyle\s*=\s*\")([^\"]*)(\")", lambda m: m.group(1) + rewrite_css(m.group(2)) + m.group(3), html, flags=re.I)
+        if re.search(r"<head[^>]*>", html, re.I):
+            return re.sub(r"(<head[^>]*>)", r'\1<meta charset="utf-8">', html, count=1, flags=re.I)
+        return '<meta charset="utf-8">' + html
+
+    files = {"index.html": rewrite_html(html).encode("utf-8")}
+    size, failed = 0, 0
+    with ThreadPoolExecutor(8) as ex:
+        for u, r in zip(links, ex.map(lambda x: fetch(x, deadline), links)):
+            if not r or size > MAX_TOTAL:
+                failed += 1
+                continue
+            final, ctype, data, enc = r
+            path = links[u]
+            if path.lower().endswith(".css") or "css" in ctype:
+                data = rewrite_css(decode(data, enc)).encode("utf-8")
+            size += len(data)
+            files[path] = data
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p, d in files.items():
+            z.writestr(p, d)
+        z.writestr("README.txt", "Captured from %s\nFiles: %d (failed/skipped: %d)\nOpen index.html in a browser.\n" % (page_url, len(files), failed))
+    return buf.getvalue(), len(files), re.sub(r"[^\w.\-]", "_", main)
+
+
+@app.route("/capture/zip/<token>")
+def capture_zip(token):
+    cap_gc()
+    with CAP_LOCK:
+        d = CAP_STORE.pop(token, None)
+    if not d:
+        return "This capture has expired or was already downloaded. Capture the page again.", 404
+    if not GRAB_SLOTS.acquire(blocking=False):
+        with CAP_LOCK:
+            CAP_STORE[token] = d
+        return "Server is busy, try again in a moment.", 503
+    try:
+        data, n, name = build_capture_zip(d["url"], d["html"], d["assets"], time.time() + 40)
+    finally:
+        GRAB_SLOTS.release()
+    resp = Response(data, mimetype="application/zip")
+    resp.headers["Content-Disposition"] = 'attachment; filename="%s.zip"' % name
+    return resp
+
+
+@app.route("/capture")
+def capture_page():
+    host = request.host_url.rstrip("/")
+    bm = ("javascript:(function(){try{var h=document.documentElement.outerHTML;var u=new Set();"
+          "document.querySelectorAll('link[href],script[src],img[src],source[src],video[src],audio[src]')"
+          ".forEach(function(e){var v=e.href||e.src;if(v)u.add(v)});"
+          "try{performance.getEntriesByType('resource').forEach(function(r){u.add(r.name)})}catch(e){}"
+          "fetch('%s/capture/submit',{method:'POST',headers:{'Content-Type':'application/json'},"
+          "body:JSON.stringify({url:location.href,html:h,assets:Array.from(u)})})"
+          ".then(function(r){return r.json()}).then(function(d){if(d.token){location.href='%s/capture/zip/'+d.token}"
+          "else{alert(d.error||'Capture failed')}}).catch(function(e){alert('Capture failed: '+e.message)})"
+          "}catch(e){alert('Capture failed: '+e.message)}})();") % (host, host)
+    return render("capture.html", bookmarklet=bm)
 
 
 # ---------------- admin ----------------
