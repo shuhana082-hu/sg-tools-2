@@ -1,4 +1,7 @@
-import os, re, sqlite3, time, secrets
+import os, re, io, zipfile, hashlib, ipaddress, socket, threading, posixpath, sqlite3, time, secrets
+from urllib.parse import urlparse, urljoin, unquote, urldefrag
+from concurrent.futures import ThreadPoolExecutor
+import requests
 from functools import wraps
 from flask import Flask, Request, g, request, session, redirect, jsonify, Response, abort
 from jinja2 import Environment, DictLoader
@@ -27,6 +30,7 @@ DEFAULTS = {
 }
 
 ICONS = {
+    "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
     "bolt": '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
     "heart": '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1.1L12 21.2l7.8-7.7 1-1.1a5.5 5.5 0 0 0 0-7.8z"/>',
     "image": '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
@@ -339,6 +343,33 @@ var im=new Image();im.onload=function(){var r=Math.min(1,600/Math.max(im.width,i
 c.getContext('2d').drawImage(im,0,0,c.width,c.height);
 c.toBlob(function(b){if(!b)return;try{var dt=new DataTransfer();dt.items.add(new File([b],'photo.webp',{type:b.type}));inp.files=dt.files}catch(e){}},'image/webp',0.85)};im.src=URL.createObjectURL(f)};</script>{% endblock %}"""
 
+T["sitegrab.html"] = r"""{% extends "base.html" %}{% block title %}Site Downloader{% endblock %}{% block body %}
+<div class="wrap" style="max-width:640px">
+<div class="top fade"><h2>{{ icon('download') }}Site Downloader</h2><a class="btn ghost sm" href="/">Home</a></div>
+<div class="box fade" style="--d:80ms">
+  <p class="mut" style="margin-bottom:16px">Enter a website link. Its HTML, CSS, JavaScript, images and fonts are collected into one ZIP file that opens offline.</p>
+  <label class="l">Website link</label>
+  <input id="u" inputmode="url" autocapitalize="off" placeholder="https://example.com">
+  <label class="l" style="margin-top:12px">What to download</label>
+  <select id="m"><option value="1">Single page</option><option value="5">Whole site, up to 5 pages</option><option value="15">Whole site, up to 15 pages</option><option value="40">Whole site, up to 40 pages</option></select>
+  <button class="btn" id="go" style="width:100%;margin-top:16px">{{ icon('download') }}Download files</button>
+  <div id="st" class="mut" style="margin-top:14px;min-height:22px"></div>
+</div>
+<p class="mut fade" style="--d:160ms;font-size:.8rem">Only download websites you own or have permission to copy. Sites that build their content with JavaScript (React, Next.js and similar) may not look complete offline.</p>
+</div>
+<script>
+var b=document.getElementById('go'),st=document.getElementById('st'),tm;
+b.onclick=function(){var u=document.getElementById('u').value.trim();if(!u){st.textContent='Enter a link first';return}
+ b.disabled=true;var s0=Date.now();st.textContent='Working... 0s (can take up to a minute)';
+ tm=setInterval(function(){st.textContent='Working... '+Math.round((Date.now()-s0)/1000)+'s (can take up to a minute)'},1000);
+ fetch('/sitegrab/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u,pages:+document.getElementById('m').value})})
+ .then(function(r){if(!r.ok)return r.json().then(function(j){throw new Error(j.error||'Failed')});
+  var n=r.headers.get('X-Files')||'',nm=r.headers.get('X-Name')||'site';
+  return r.blob().then(function(bl){var a=document.createElement('a');a.href=URL.createObjectURL(bl);a.download=nm+'.zip';document.body.append(a);a.click();a.remove();st.textContent='Done. '+n+' files saved in the ZIP.'})})
+ .catch(function(e){st.textContent=e.message||'Failed'})
+ .then(function(){clearInterval(tm);b.disabled=false})};
+</script>{% endblock %}"""
+
 env = Environment(loader=DictLoader(T), autoescape=True)
 
 
@@ -403,6 +434,254 @@ def chat():
     n = q("SELECT COUNT(*) c FROM online WHERE ts>?", (now - 30,), True)["c"]
     rows = q("SELECT id,name,text,ts FROM msgs ORDER BY id DESC LIMIT 60")[::-1]
     return jsonify(msgs=[dict(r) for r in rows], online=n)
+
+
+# ---------------- site downloader ----------------
+ASSET_EXT = {"css", "js", "mjs", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "avif", "woff", "woff2",
+             "ttf", "otf", "eot", "mp4", "webm", "mp3", "ogg", "wav", "json", "xml", "txt", "pdf", "zip", "map", "webmanifest"}
+PAGE_EXT = {"", "html", "htm", "php", "asp", "aspx", "jsp"}
+UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+ALLOWED_PORTS = (None, 80, 443)
+GRAB_SLOTS = threading.Semaphore(2)
+GRAB_HITS = {}
+MAX_TOTAL = 60 * 1024 * 1024
+TAG_RE = re.compile(r"<(a|area|link|script|img|source|video|audio|iframe|embed|track)\b([^>]*)>", re.I | re.S)
+ATTR_RE = re.compile(r"\b(src|href|poster|data-src|srcset|data-srcset)\s*=\s*(\"([^\"]*)\"|'([^']*)')", re.I)
+CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.I)
+CSS_IMP_RE = re.compile(r"@import\s+(['\"])(.*?)\1", re.I)
+
+
+def safe_host(host):
+    try:
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def fetch(u, deadline, limit=15 * 1024 * 1024):
+    try:
+        for _ in range(5):
+            p = urlparse(u)
+            if p.scheme not in ("http", "https") or not p.hostname or p.port not in ALLOWED_PORTS or not safe_host(p.hostname):
+                return None
+            r = requests.get(u, timeout=10, stream=True, allow_redirects=False, headers={"User-Agent": UA})
+            if r.status_code in (301, 302, 303, 307, 308):
+                u = urljoin(u, r.headers.get("Location", ""))
+                r.close()
+                continue
+            if r.status_code != 200:
+                r.close()
+                return None
+            buf, n = io.BytesIO(), 0
+            for ch in r.iter_content(65536):
+                n += len(ch)
+                if n > limit or time.time() > deadline:
+                    r.close()
+                    return None
+                buf.write(ch)
+            return u, r.headers.get("Content-Type", "").split(";")[0].strip().lower(), buf.getvalue(), r.encoding
+    except Exception:
+        return None
+    return None
+
+
+def lpath(u, main, page=False, force=None):
+    p = urlparse(u)
+    path = unquote(p.path) or "/"
+    if path.endswith("/"):
+        path += "index.html"
+    if page and not path.lower().endswith((".html", ".htm")):
+        path += ".html"
+    if force and not posixpath.splitext(path)[1]:
+        path += force
+    if p.query:
+        root, ext = posixpath.splitext(path)
+        path = root + "_" + hashlib.md5(p.query.encode()).hexdigest()[:6] + ext
+    path = re.sub(r"[^\w.\-/@]", "_", path).lstrip("/")
+    path = re.sub(r"\.{2,}", ".", path)
+    if p.netloc.lower() != main:
+        path = "_ext/" + re.sub(r"[^\w.\-]", "_", p.netloc) + "/" + path
+    return path[:200]
+
+
+def decode(data, enc):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode(enc or "latin-1", "replace")
+
+
+def grab(start, maxpages):
+    main = urlparse(start).netloc.lower()
+    t0 = time.time()
+    t_pages, t_end = t0 + 25, t0 + 55
+    files, assets, pages, queue = {}, {}, {start: "index.html"}, [start]
+    stat = {"failed": 0, "size": 0}
+
+    def rel(target, cur):
+        return posixpath.relpath(target, posixpath.dirname(cur) or ".")
+
+    def clean(v):
+        return v.replace("(", "%28").replace(")", "%29").replace(" ", "%20").replace('"', "%22").replace("'", "%27")
+
+    def ref(value, base, cur, kind):
+        v = value.strip()
+        if not v or v[0] == "#" or re.match(r"(data|javascript|mailto|tel|blob|about):", v, re.I):
+            return value
+        a = urldefrag(urljoin(base, v))[0]
+        pu = urlparse(a)
+        if pu.scheme not in ("http", "https"):
+            return value
+        if kind == "page":
+            ext = posixpath.splitext(pu.path)[1].lower().lstrip(".")
+            if pu.netloc.lower() == main and maxpages > 1 and ext in PAGE_EXT:
+                if a not in pages and len(pages) < maxpages:
+                    pages[a] = lpath(a, main, True)
+                    queue.append(a)
+                if a in pages:
+                    return rel(pages[a], cur)
+            return a
+        if kind == "abs":
+            return a
+        if a not in assets:
+            if len(assets) >= 600:
+                return a
+            assets[a] = lpath(a, main, force={"css": ".css", "js": ".js"}.get(kind))
+        return rel(assets[a], cur)
+
+    def rewrite_css(text, base, cur):
+        def u(m):
+            q = m.group(1)
+            return "url(%s%s%s)" % (q, clean(ref(m.group(2), base, cur, "asset")), q)
+        text = CSS_URL_RE.sub(u, text)
+        return CSS_IMP_RE.sub(lambda m: "@import %s%s%s" % (m.group(1), clean(ref(m.group(2), base, cur, "asset")), m.group(1)), text)
+
+    def rewrite_html(html, base, cur):
+        html = re.sub(r"<base\b[^>]*>", "", html, flags=re.I)
+        html = re.sub(r"\sintegrity\s*=\s*(\"[^\"]*\"|'[^']*')", "", html, flags=re.I)
+
+        def tag(m):
+            name, attrs = m.group(1).lower(), m.group(2)
+            if name == "link":
+                rv = " ".join(re.findall(r"rel\s*=\s*[\"']([^\"']*)[\"']", attrs, re.I)).lower()
+                kind = "css" if "stylesheet" in rv else ("asset" if re.search(r"icon|manifest|preload|modulepreload", rv) else "abs")
+            elif name in ("a", "area"):
+                kind = "page"
+            elif name == "iframe":
+                kind = "abs"
+            elif name == "script":
+                kind = "js"
+            else:
+                kind = "asset"
+
+            def at(am):
+                attr = am.group(1).lower()
+                val = am.group(3) if am.group(3) is not None else am.group(4)
+                q = '"' if am.group(3) is not None else "'"
+                if attr in ("srcset", "data-srcset"):
+                    parts = []
+                    for part in val.split(","):
+                        bits = part.strip().split(None, 1)
+                        if bits:
+                            parts.append(" ".join([ref(bits[0], base, cur, kind)] + bits[1:]))
+                    nv = ", ".join(parts)
+                else:
+                    nv = ref(val, base, cur, kind)
+                return "%s=%s%s%s" % (am.group(1), q, nv.replace('"', "%22").replace("'", "%27"), q)
+            return "<" + m.group(1) + ATTR_RE.sub(at, attrs) + ">"
+
+        html = TAG_RE.sub(tag, html)
+        html = re.sub(r"(<style[^>]*>)(.*?)(</style>)", lambda m: m.group(1) + rewrite_css(m.group(2), base, cur) + m.group(3), html, flags=re.I | re.S)
+        html = re.sub(r"(\sstyle\s*=\s*\")([^\"]*)(\")", lambda m: m.group(1) + rewrite_css(m.group(2), base, cur) + m.group(3), html, flags=re.I)
+        if re.search(r"<head[^>]*>", html, re.I):
+            return re.sub(r"(<head[^>]*>)", r'\1<meta charset="utf-8">', html, count=1, flags=re.I)
+        return '<meta charset="utf-8">' + html
+
+    while queue and time.time() < (t_pages if len(files) else t_end):
+        u = queue.pop(0)
+        r = fetch(u, t_end)
+        if not r:
+            if u == start:
+                raise ValueError("Could not open this website. Check the link, or the site may block downloads.")
+            continue
+        final, ctype, data, enc = r
+        if "html" not in ctype:
+            if u == start:
+                raise ValueError("This link is not a web page. Enter the website address, not a file.")
+            continue
+        cur = pages[u]
+        files[cur] = rewrite_html(decode(data, enc), final, cur).encode("utf-8")
+
+    fetched = set()
+    with ThreadPoolExecutor(8) as ex:
+        while time.time() < t_end and stat["size"] < MAX_TOTAL:
+            todo = [u for u in assets if u not in fetched][:40]
+            if not todo:
+                break
+            fetched.update(todo)
+            for u, r in zip(todo, ex.map(lambda x: fetch(x, t_end), todo)):
+                if not r:
+                    stat["failed"] += 1
+                    continue
+                final, ctype, data, enc = r
+                path = assets[u]
+                if path.lower().endswith(".css") or "css" in ctype:
+                    data = rewrite_css(decode(data, enc), final, path).encode("utf-8")
+                stat["size"] += len(data)
+                files[path] = data
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p, d in files.items():
+            z.writestr(p, d)
+        z.writestr("README.txt", "Downloaded from %s\nPages: %d\nAssets: %d (failed or skipped: %d)\nOpen index.html in a browser.\n"
+                   % (start, len(pages), len(files) - len(pages), stat["failed"]))
+    return buf.getvalue(), len(files), re.sub(r"[^\w.\-]", "_", main)
+
+
+@app.route("/sitegrab")
+def sitegrab_page():
+    return render("sitegrab.html")
+
+
+@app.route("/sitegrab/download", methods=["POST"])
+def sitegrab_dl():
+    d = request.get_json(silent=True) or {}
+    url = str(d.get("url", "")).strip()
+    if url and not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    p = urlparse(url)
+    try:
+        pages = max(1, min(40, int(d.get("pages", 1))))
+    except (TypeError, ValueError):
+        pages = 1
+    if not p.hostname or p.port not in ALLOWED_PORTS or not safe_host(p.hostname):
+        return jsonify(error="This link is not valid or not allowed."), 400
+    ip = (request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",")[0].strip()
+    now = time.time()
+    hits = [x for x in GRAB_HITS.get(ip, []) if now - x < 600]
+    if len(hits) >= 5:
+        return jsonify(error="Too many downloads. Try again in a few minutes."), 429
+    if not GRAB_SLOTS.acquire(blocking=False):
+        return jsonify(error="Server is busy. Try again in a moment."), 503
+    try:
+        GRAB_HITS[ip] = hits + [now]
+        data, n, name = grab(urldefrag(url)[0], pages)
+    except ValueError as e:
+        return jsonify(error=str(e)), 422
+    except Exception:
+        return jsonify(error="Something went wrong while downloading this site."), 500
+    finally:
+        GRAB_SLOTS.release()
+    resp = Response(data, mimetype="application/zip")
+    resp.headers["Content-Disposition"] = 'attachment; filename="%s.zip"' % name
+    resp.headers["X-Files"] = str(n)
+    resp.headers["X-Name"] = name
+    return resp
 
 
 # ---------------- admin ----------------
